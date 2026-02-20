@@ -11,6 +11,7 @@ import os
 import re
 import signal
 import sys
+import time
 
 import panoramisk
 from pyp8s import MetricsHandler
@@ -26,8 +27,13 @@ AMI_PORT = int(os.environ.get("AMI_PORT", "5038"))
 AMI_USER = os.environ.get("AMI_USER", "prometheus_monitor")
 AMI_SECRET = os.environ.get("AMI_SECRET", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
+# Optional comma-separated static list of PJSIP endpoint names to monitor.
+# When set, only those endpoints are polled and no discovery query is made.
+# When empty (the default) all endpoints are discovered dynamically via
+# PJSIPShowEndpoints; discovery is cached for PJSIP_DISCOVERY_TTL seconds.
 PJSIP_TRUNKS_RAW = os.environ.get("PJSIP_TRUNKS", "")
 PJSIP_TRUNKS = [t.strip() for t in PJSIP_TRUNKS_RAW.split(",") if t.strip()]
+PJSIP_DISCOVERY_TTL = int(os.environ.get("PJSIP_DISCOVERY_TTL", str(5 * POLL_INTERVAL)))
 METRICS_LISTEN_ADDRESS = os.environ.get("METRICS_LISTEN_ADDRESS", "0.0.0.0")
 METRICS_LISTEN_PORT = int(os.environ.get("METRICS_LISTEN_PORT", "9100"))
 
@@ -51,6 +57,12 @@ def init_metrics():
                         "Asterisk uptime in seconds")
     MetricsHandler.init("asterisk_ami_connected", "gauge",
                         "AMI connection status (1=connected, 0=disconnected)")
+    MetricsHandler.init("asterisk_poll_errors_total", "counter",
+                        "Total polling errors by area")
+    MetricsHandler.init("asterisk_poll_cycles_total", "counter",
+                        "Total completed poll cycles")
+    MetricsHandler.init("asterisk_last_poll_duration_seconds", "gauge",
+                        "Duration of the last poll cycle in seconds")
 
 
 class AsteriskExporter:
@@ -58,6 +70,8 @@ class AsteriskExporter:
         self._manager = None
         self._connected = False
         self._loop = None
+        self._endpoint_cache: list = []
+        self._endpoint_cache_time: float = 0.0
 
     def _build_manager(self):
         return panoramisk.Manager(
@@ -128,10 +142,37 @@ class AsteriskExporter:
         logger.debug("Registry event: driver=%s domain=%s status=%s",
                      channel_driver, domain, status)
 
+    async def _get_pjsip_endpoints(self):
+        """Return all PJSIP endpoint names by querying PJSIPShowEndpoints."""
+        try:
+            response = await self._manager.send_action({"Action": "PJSIPShowEndpoints"})
+            if not response:
+                return []
+            events = response if isinstance(response, list) else [response]
+            return [
+                ev.get("ObjectName", "")
+                for ev in events
+                if ev.get("Event") == "EndpointList" and ev.get("ObjectName")
+            ]
+        except Exception as exc:
+            logger.warning("Failed to discover PJSIP endpoints: %s", exc)
+            MetricsHandler.inc("asterisk_poll_errors_total", 1, area="pjsip_discovery")
+            return []
+
     async def _poll_pjsip_trunks(self):
-        if not PJSIP_TRUNKS:
+        # When PJSIP_TRUNKS is set, use that static list directly.
+        # Otherwise discover all endpoints, refreshing the cache when stale.
+        if PJSIP_TRUNKS:
+            trunks = PJSIP_TRUNKS
+        else:
+            now = time.monotonic()
+            if not self._endpoint_cache or (now - self._endpoint_cache_time) > PJSIP_DISCOVERY_TTL:
+                self._endpoint_cache = await self._get_pjsip_endpoints()
+                self._endpoint_cache_time = now
+            trunks = self._endpoint_cache
+        if not trunks:
             return
-        for trunk in PJSIP_TRUNKS:
+        for trunk in trunks:
             try:
                 response = await self._manager.send_action({
                     "Action": "PJSIPShowEndpoint",
@@ -151,6 +192,15 @@ class AsteriskExporter:
                             try:
                                 latency_ms = float(rtt) / 1000.0
                             except (ValueError, TypeError):
+                                # RoundtripUsec is empty string or "N/A" when the
+                                # qualify timer has not fired yet or the contact has
+                                # never been qualified. Treat as 0 ms until data
+                                # becomes available.
+                                logger.debug(
+                                    "PJSIP trunk %s: non-numeric RoundtripUsec %r "
+                                    "(contact not yet qualified), treating as 0 ms",
+                                    trunk, rtt,
+                                )
                                 latency_ms = 0.0
                 MetricsHandler.set("asterisk_pjsip_trunk_status", registered, trunk=trunk)
                 MetricsHandler.set("asterisk_pjsip_trunk_latency_ms", latency_ms, trunk=trunk)
@@ -158,6 +208,7 @@ class AsteriskExporter:
                              trunk, registered, latency_ms)
             except Exception as exc:
                 logger.warning("Failed to poll PJSIP trunk %s: %s", trunk, exc)
+                MetricsHandler.inc("asterisk_poll_errors_total", 1, area="pjsip_trunk")
                 MetricsHandler.set("asterisk_pjsip_trunk_status", 0, trunk=trunk)
 
     async def _poll_active_channels(self):
@@ -173,6 +224,7 @@ class AsteriskExporter:
             logger.debug("Active channels: %d", count)
         except Exception as exc:
             logger.warning("Failed to poll active channels: %s", exc)
+            MetricsHandler.inc("asterisk_poll_errors_total", 1, area="active_channels")
 
     async def _poll_active_calls(self):
         try:
@@ -187,6 +239,7 @@ class AsteriskExporter:
             logger.debug("Active calls: %d", count)
         except Exception as exc:
             logger.warning("Failed to poll active calls: %s", exc)
+            MetricsHandler.inc("asterisk_poll_errors_total", 1, area="active_calls")
 
     async def _poll_sccp_devices(self):
         try:
@@ -217,6 +270,7 @@ class AsteriskExporter:
                                  device_name, device_type, status_val)
         except Exception as exc:
             logger.warning("Failed to poll SCCP devices: %s", exc)
+            MetricsHandler.inc("asterisk_poll_errors_total", 1, area="sccp_devices")
 
     async def _poll_system_uptime(self):
         try:
@@ -232,6 +286,7 @@ class AsteriskExporter:
             logger.debug("Asterisk uptime: %d seconds", uptime_seconds)
         except Exception as exc:
             logger.warning("Failed to poll system uptime: %s", exc)
+            MetricsHandler.inc("asterisk_poll_errors_total", 1, area="system_uptime")
 
     @staticmethod
     def _parse_uptime(uptime_str):
@@ -254,6 +309,7 @@ class AsteriskExporter:
     async def _poll_loop(self):
         while True:
             if self._connected:
+                cycle_start = time.monotonic()
                 logger.info("Running poll cycle")
                 await asyncio.gather(
                     self._poll_pjsip_trunks(),
@@ -263,6 +319,10 @@ class AsteriskExporter:
                     self._poll_system_uptime(),
                     return_exceptions=True,
                 )
+                duration = time.monotonic() - cycle_start
+                MetricsHandler.inc("asterisk_poll_cycles_total", 1)
+                MetricsHandler.set("asterisk_last_poll_duration_seconds", duration)
+                logger.info("Poll cycle completed in %.3f seconds", duration)
             await asyncio.sleep(POLL_INTERVAL)
 
     async def run(self):

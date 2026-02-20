@@ -13,7 +13,12 @@ services:
       AMI_USER: "prometheus_monitor"
       AMI_SECRET: "changeme"
       POLL_INTERVAL: "30"
-      PJSIP_TRUNKS: "trunk-provider1,trunk-provider2"
+      # PJSIP_TRUNKS: ""  # Optional allowlist; all endpoints are discovered when unset
       METRICS_LISTEN_ADDRESS: "0.0.0.0"
       METRICS_LISTEN_PORT: "9100"
     # network_mode: host  # Uncomment if Asterisk AMI is only reachable on the host network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"

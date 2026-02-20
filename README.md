@@ -50,7 +50,8 @@ All configuration is done via environment variables:
 | `AMI_USER` | `prometheus_monitor` | No | AMI username |
 | `AMI_SECRET` | — | **Yes** | AMI password |
 | `POLL_INTERVAL` | `30` | No | Polling interval in seconds |
-| `PJSIP_TRUNKS` | — | No | Comma-separated PJSIP endpoint names |
+| `PJSIP_TRUNKS` | — | No | Optional comma-separated static list of PJSIP endpoint names; when set, only those endpoints are polled with no discovery query |
+| `PJSIP_DISCOVERY_TTL` | `5×POLL_INTERVAL` | No | Seconds to cache the dynamically discovered endpoint list |
 | `METRICS_LISTEN_ADDRESS` | `0.0.0.0` | No | Metrics HTTP listen address |
 | `METRICS_LISTEN_PORT` | `9100` | No | Metrics HTTP listen port |
 
@@ -77,6 +78,9 @@ asterisk -rx "manager reload"
 | `asterisk_sccp_devices` | gauge | `device`, `type` | SCCP device status (1=registered) |
 | `asterisk_uptime_seconds` | gauge | — | Asterisk uptime in seconds |
 | `asterisk_ami_connected` | gauge | — | AMI connection status (1=connected) |
+| `asterisk_poll_errors_total` | counter | `area` | Polling errors by subsystem |
+| `asterisk_poll_cycles_total` | counter | — | Total completed poll cycles |
+| `asterisk_last_poll_duration_seconds` | gauge | — | Duration of the last poll cycle |
 
 ## Prometheus Configuration
 
