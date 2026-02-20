@@ -1,0 +1,2 @@
+panoramisk>=1.4
+pyp8s
