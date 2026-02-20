@@ -1,0 +1,14 @@
+[general]
+enabled = yes
+port = 5038
+bindaddr = 127.0.0.1
+
+; Asterisk Manager Interface configuration for Prometheus exporter
+; Copy relevant sections into /etc/asterisk/manager.conf
+
+[prometheus_monitor]
+secret = changeme
+deny = 0.0.0.0/0.0.0.0
+permit = 127.0.0.1/255.255.255.0
+read = system,call,log,verbose,agent,user,config,command,dialplan,reporting
+write = command
