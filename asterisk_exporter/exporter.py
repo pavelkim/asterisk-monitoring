@@ -16,11 +16,18 @@ import time
 import panoramisk
 from pyp8s import MetricsHandler
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+# Configure our logger with a dedicated handler and no propagation so that
+# third-party libraries adding their own root-logger handlers do not cause
+# duplicate log lines.
 logger = logging.getLogger("asterisk_exporter")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    logger.addHandler(_handler)
+logger.propagate = False
 
 AMI_HOST = os.environ.get("AMI_HOST", "127.0.0.1")
 AMI_PORT = int(os.environ.get("AMI_PORT", "5038"))
@@ -149,11 +156,13 @@ class AsteriskExporter:
             if not response:
                 return []
             events = response if isinstance(response, list) else [response]
-            return [
+            names = [
                 ev.get("ObjectName", "")
                 for ev in events
                 if ev.get("Event") == "EndpointList" and ev.get("ObjectName")
             ]
+            logger.info("Discovered %d PJSIP endpoints: %s", len(names), names)
+            return names
         except Exception as exc:
             logger.warning("Failed to discover PJSIP endpoints: %s", exc)
             MetricsHandler.inc("asterisk_poll_errors_total", 1, area="pjsip_discovery")
@@ -204,8 +213,8 @@ class AsteriskExporter:
                                 latency_ms = 0.0
                 MetricsHandler.set("asterisk_pjsip_trunk_status", registered, trunk=trunk)
                 MetricsHandler.set("asterisk_pjsip_trunk_latency_ms", latency_ms, trunk=trunk)
-                logger.debug("PJSIP trunk %s: registered=%d latency_ms=%.3f",
-                             trunk, registered, latency_ms)
+                logger.info("PJSIP trunk %s: registered=%d latency_ms=%.3f",
+                            trunk, registered, latency_ms)
             except Exception as exc:
                 logger.warning("Failed to poll PJSIP trunk %s: %s", trunk, exc)
                 MetricsHandler.inc("asterisk_poll_errors_total", 1, area="pjsip_trunk")
@@ -221,7 +230,7 @@ class AsteriskExporter:
                     1 for ev in events if ev.get("Event") == "CoreShowChannel"
                 )
             MetricsHandler.set("asterisk_active_channels", count)
-            logger.debug("Active channels: %d", count)
+            logger.info("Active channels: %d", count)
         except Exception as exc:
             logger.warning("Failed to poll active channels: %s", exc)
             MetricsHandler.inc("asterisk_poll_errors_total", 1, area="active_channels")
@@ -236,10 +245,40 @@ class AsteriskExporter:
                     1 for ev in events if ev.get("Event") == "BridgeListItem"
                 )
             MetricsHandler.set("asterisk_active_calls", count)
-            logger.debug("Active calls: %d", count)
+            logger.info("Active calls: %d", count)
         except Exception as exc:
             logger.warning("Failed to poll active calls: %s", exc)
             MetricsHandler.inc("asterisk_poll_errors_total", 1, area="active_calls")
+
+    @staticmethod
+    def _extract_command_output(response):
+        """Extract text output from an AMI Command response.
+
+        Asterisk can return command output in three different shapes:
+        - ``Response: Follows`` — output is in ``message.content`` (body)
+        - Single ``Output: <line>`` header — a plain string
+        - Multiple ``Output: <line>`` headers — panoramisk represents these
+          as a list of strings on the same ``Output`` key
+        """
+        if not response:
+            return ""
+        if isinstance(response, list):
+            parts = []
+            for ev in response:
+                out = ev.get("Output", "")
+                if isinstance(out, list):
+                    parts.extend(out)
+                else:
+                    parts.append(out)
+            return "\n".join(p for p in parts if p)
+        # Single Message object
+        out = response.get("Output")
+        if out is not None:
+            if isinstance(out, list):
+                return "\n".join(out)
+            return out
+        # Fallback: Response: Follows stores output as message body
+        return getattr(response, "content", "") or ""
 
     async def _poll_sccp_devices(self):
         try:
@@ -247,13 +286,7 @@ class AsteriskExporter:
                 "Action": "Command",
                 "Command": "sccp show devices",
             })
-            output = ""
-            if response:
-                if isinstance(response, list):
-                    for ev in response:
-                        output += ev.get("Output", "")
-                else:
-                    output = response.get("Output", "")
+            output = self._extract_command_output(response)
             for line in output.splitlines():
                 line = line.strip()
                 if not line or line.startswith("Name") or line.startswith("---"):
@@ -263,11 +296,11 @@ class AsteriskExporter:
                     device_name = parts[0]
                     device_type = parts[1]
                     reg_status = parts[2].lower()
-                    status_val = 1 if reg_status == "registered" else 0
-                    MetricsHandler.set("asterisk_sccp_devices", status_val,
+                    registered = 1 if reg_status == "registered" else 0
+                    MetricsHandler.set("asterisk_sccp_devices", registered,
                                        device=device_name, type=device_type)
-                    logger.debug("SCCP device %s type=%s status=%d",
-                                 device_name, device_type, status_val)
+                    logger.info("SCCP device %s type=%s registered=%d",
+                                device_name, device_type, registered)
         except Exception as exc:
             logger.warning("Failed to poll SCCP devices: %s", exc)
             MetricsHandler.inc("asterisk_poll_errors_total", 1, area="sccp_devices")
@@ -283,7 +316,7 @@ class AsteriskExporter:
                 uptime_str = ev.get("CoreUptime", "") or ev.get("Uptime", "")
                 uptime_seconds = self._parse_uptime(uptime_str)
             MetricsHandler.set("asterisk_uptime_seconds", uptime_seconds)
-            logger.debug("Asterisk uptime: %d seconds", uptime_seconds)
+            logger.info("Asterisk uptime: %d seconds", uptime_seconds)
         except Exception as exc:
             logger.warning("Failed to poll system uptime: %s", exc)
             MetricsHandler.inc("asterisk_poll_errors_total", 1, area="system_uptime")
