@@ -85,16 +85,16 @@ class AsteriskExporter:
             on_disconnect=self._on_disconnect,
         )
 
-    def _on_connect(self, manager, future):
+    def _on_connect(self, manager):
         logger.info("AMI connection established")
 
-    def _on_login(self, manager, future):
+    def _on_login(self, manager):
         logger.info("AMI login successful")
         self._connected = True
         MetricsHandler.set("asterisk_ami_connected", 1)
 
-    def _on_disconnect(self, manager, future):
-        logger.warning("AMI disconnected")
+    def _on_disconnect(self, manager, exc=None):
+        logger.warning("AMI disconnected: %s", exc)
         self._connected = False
         MetricsHandler.set("asterisk_ami_connected", 0)
 
